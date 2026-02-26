@@ -1,0 +1,33 @@
+name: Daily Repository Update
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  daily-commit:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Daily update step for 25ds3000116@ds.study.iitm.ac.in
+        run: |
+          mkdir -p .github
+          echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> .github/daily-update.log
+
+      - name: Commit and push changes
+        run: |
+          git add .github/daily-update.log
+          git commit -m "chore: daily automated update $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || exit 0
+          git push
