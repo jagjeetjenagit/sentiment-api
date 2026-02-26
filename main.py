@@ -2,6 +2,10 @@ import os
 import json
 import re
 import sys
+import time
+import glob
+import shutil
+import tempfile
 import traceback
 from io import StringIO
 from contextlib import redirect_stdout, redirect_stderr
@@ -14,6 +18,7 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 import requests
+import yt_dlp
 
 load_dotenv()
 
@@ -51,6 +56,21 @@ class CodeInterpreterResponse(BaseModel):
 
 class ErrorAnalysis(BaseModel):
     error_lines: List[int]
+
+
+class AskRequest(BaseModel):
+    video_url: str
+    topic: str
+
+
+class AskResponse(BaseModel):
+    timestamp: str
+    video_url: str
+    topic: str
+
+
+class TimestampResult(BaseModel):
+    timestamp: str
 
 
 @app.get("/")
@@ -215,6 +235,99 @@ Return the line number(s) where the error is located.
         return _extract_traceback_lines(traceback_text)
     return result.error_lines
 
+
+def _download_audio_only(video_url: str) -> tuple[str, str]:
+    temp_dir = tempfile.mkdtemp(prefix="yt_audio_")
+    output_template = os.path.join(temp_dir, "audio.%(ext)s")
+
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": output_template,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(video_url, download=True)
+        audio_path = ydl.prepare_filename(info)
+
+    if not os.path.exists(audio_path):
+        candidates = sorted(glob.glob(os.path.join(temp_dir, "audio.*")))
+        if not candidates:
+            raise RuntimeError("Audio download failed")
+        audio_path = candidates[0]
+
+    return temp_dir, audio_path
+
+
+def _wait_for_file_active(gemini_client: genai.Client, file_name: str, timeout_seconds: int = 300) -> object:
+    deadline = time.time() + timeout_seconds
+
+    while time.time() < deadline:
+        file_obj = gemini_client.files.get(name=file_name)
+        state_obj = getattr(file_obj, "state", None)
+        state_name = getattr(state_obj, "name", str(state_obj))
+
+        if state_name == "ACTIVE":
+            return file_obj
+
+        if state_name in {"FAILED", "ERROR", "CANCELLED"}:
+            raise RuntimeError(f"Gemini file processing failed with state: {state_name}")
+
+        time.sleep(2)
+
+    raise RuntimeError("Timed out waiting for Gemini file to become ACTIVE")
+
+
+def _find_topic_timestamp(video_url: str, topic: str) -> str:
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+
+    temp_dir = None
+    try:
+        temp_dir, audio_path = _download_audio_only(video_url)
+
+        gemini_client = genai.Client(api_key=gemini_api_key)
+        uploaded = gemini_client.files.upload(file=audio_path)
+        active_file = _wait_for_file_active(gemini_client, uploaded.name)
+
+        prompt = f"""
+You are analyzing spoken audio from a YouTube video.
+Find the FIRST moment when this topic or phrase is spoken: {topic}
+
+Return exactly one timestamp in HH:MM:SS format.
+Do not return explanations.
+"""
+
+        response = gemini_client.models.generate_content(
+            model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+            contents=[active_file, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "timestamp": types.Schema(
+                            type=types.Type.STRING,
+                            pattern=r"^\\d{2}:\\d{2}:\\d{2}$",
+                        )
+                    },
+                    required=["timestamp"],
+                ),
+            ),
+        )
+
+        result = TimestampResult.model_validate_json(response.text)
+        if not re.match(r"^\d{2}:\d{2}:\d{2}$", result.timestamp):
+            raise RuntimeError("Invalid timestamp format returned by model")
+
+        return result.timestamp
+    finally:
+        if temp_dir and os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
 @app.post("/comment", response_model=SentimentResponse)
 async def analyze_comment(request: CommentRequest):
     try:
@@ -233,6 +346,16 @@ async def code_interpreter(request: CodeExecutionRequest):
 
     error_lines = analyze_error_with_ai(request.code, execution_result["output"])
     return CodeInterpreterResponse(error=error_lines, result=execution_result["output"])
+
+
+@app.post("/ask", response_model=AskResponse)
+async def ask_video(request: AskRequest):
+    timestamp = _find_topic_timestamp(request.video_url, request.topic)
+    return AskResponse(
+        timestamp=timestamp,
+        video_url=request.video_url,
+        topic=request.topic,
+    )
 
 def analyze_sentiment(comment):
     url = "https://sentiment-api-production-f100.up.railway.app/comment"
