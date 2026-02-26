@@ -1,10 +1,17 @@
 import os
 import json
-from typing import Literal
-from fastapi import FastAPI, HTTPException
+import re
+import sys
+import traceback
+from io import StringIO
+from contextlib import redirect_stdout, redirect_stderr
+from typing import Literal, List
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 import requests
 
@@ -31,6 +38,19 @@ class CommentRequest(BaseModel):
 class SentimentResponse(BaseModel):
     sentiment: Literal["positive", "negative", "neutral"]
     rating: int
+
+
+class CodeExecutionRequest(BaseModel):
+    code: str
+
+
+class CodeInterpreterResponse(BaseModel):
+    error: List[int]
+    result: str
+
+
+class ErrorAnalysis(BaseModel):
+    error_lines: List[int]
 
 
 @app.get("/")
@@ -125,6 +145,76 @@ def _ai_sentiment(comment: str) -> SentimentResponse:
     parsed = json.loads(content)
     return SentimentResponse(**parsed)
 
+
+def execute_python_code(code: str) -> dict:
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    buffer = StringIO()
+
+    try:
+        sys.stdout = buffer
+        sys.stderr = buffer
+        with redirect_stdout(buffer), redirect_stderr(buffer):
+            exec(code, {})
+        output = buffer.getvalue()
+        return {"success": True, "output": output}
+    except Exception:
+        output = traceback.format_exc()
+        return {"success": False, "output": output}
+    finally:
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+
+
+def _extract_traceback_lines(traceback_text: str) -> List[int]:
+    matches = re.findall(r'File "<string>", line (\d+)', traceback_text)
+    lines = sorted({int(value) for value in matches})
+    return lines
+
+
+def analyze_error_with_ai(code: str, traceback_text: str) -> List[int]:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return _extract_traceback_lines(traceback_text)
+
+    client = genai.Client(api_key=api_key)
+
+    prompt = f"""
+Analyze this Python code and its error traceback.
+Identify the line number(s) where the error occurred.
+
+CODE:
+{code}
+
+TRACEBACK:
+{traceback_text}
+
+Return the line number(s) where the error is located.
+"""
+
+    response = client.models.generate_content(
+        model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp"),
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "error_lines": types.Schema(
+                        type=types.Type.ARRAY,
+                        items=types.Schema(type=types.Type.INTEGER),
+                    )
+                },
+                required=["error_lines"],
+            ),
+        ),
+    )
+
+    result = ErrorAnalysis.model_validate_json(response.text)
+    if not result.error_lines:
+        return _extract_traceback_lines(traceback_text)
+    return result.error_lines
+
 @app.post("/comment", response_model=SentimentResponse)
 async def analyze_comment(request: CommentRequest):
     try:
@@ -132,6 +222,17 @@ async def analyze_comment(request: CommentRequest):
     except Exception as e:
         fallback = _fallback_sentiment(request.comment)
         return SentimentResponse(sentiment=fallback.sentiment, rating=fallback.rating)
+
+
+@app.post("/code-interpreter", response_model=CodeInterpreterResponse)
+async def code_interpreter(request: CodeExecutionRequest):
+    execution_result = execute_python_code(request.code)
+
+    if execution_result["success"]:
+        return CodeInterpreterResponse(error=[], result=execution_result["output"])
+
+    error_lines = analyze_error_with_ai(request.code, execution_result["output"])
+    return CodeInterpreterResponse(error=error_lines, result=execution_result["output"])
 
 def analyze_sentiment(comment):
     url = "https://sentiment-api-production-f100.up.railway.app/comment"
