@@ -1,0 +1,35 @@
+name: Playwright Table Scraper
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  scrape-tables:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+      
+      - name: Install Playwright and dependencies
+        run: |
+          npm install -D playwright
+          npx playwright install chromium
+      
+      - name: Run Playwright scraper for 25ds3000116@ds.study.iitm.ac.in
+        run: |
+          node playwright_scraper.js
+      
+      - name: Display completion message
+        run: |
+          echo "✓ Table scraping completed successfully"
+          echo "Check the logs above for the grand total"
