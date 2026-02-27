@@ -236,6 +236,81 @@ Return the line number(s) where the error is located.
     return result.error_lines
 
 
+def _seconds_to_timestamp(seconds_value: float) -> str:
+    total_seconds = max(0, int(seconds_value))
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def _extract_youtube_video_id(video_url: str) -> str:
+    patterns = [
+        r"(?:v=|\/)([0-9A-Za-z_-]{11})(?:[?&].*)?$",
+        r"youtu\.be\/([0-9A-Za-z_-]{11})",
+        r"youtube\.com\/shorts\/([0-9A-Za-z_-]{11})",
+        r"youtube\.com\/embed\/([0-9A-Za-z_-]{11})",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, video_url)
+        if match:
+            return match.group(1)
+
+    raise RuntimeError("Could not extract YouTube video ID")
+
+
+def _normalize_text_for_match(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9\s]", " ", value.lower())).strip()
+
+
+def _find_topic_timestamp_from_transcript(video_url: str, topic: str) -> str:
+    from youtube_transcript_api import YouTubeTranscriptApi
+
+    video_id = _extract_youtube_video_id(video_url)
+    topic_normalized = _normalize_text_for_match(topic)
+    if not topic_normalized:
+        raise RuntimeError("Topic is empty")
+
+    transcript_items = YouTubeTranscriptApi().fetch(video_id)
+
+    def _item_text(item: object) -> str:
+        if isinstance(item, dict):
+            return str(item.get("text", ""))
+        return str(getattr(item, "text", ""))
+
+    def _item_start(item: object) -> float:
+        if isinstance(item, dict):
+            return float(item.get("start", 0))
+        return float(getattr(item, "start", 0))
+
+    for item in transcript_items:
+        text = _item_text(item)
+        if topic_normalized in _normalize_text_for_match(text):
+            return _seconds_to_timestamp(_item_start(item))
+
+    topic_words = [word for word in topic_normalized.split(" ") if word]
+    if not topic_words:
+        raise RuntimeError("Topic has no searchable words")
+
+    best_score = 0.0
+    best_start = None
+    for item in transcript_items:
+        text_normalized = _normalize_text_for_match(_item_text(item))
+        if not text_normalized:
+            continue
+        present = sum(1 for word in topic_words if word in text_normalized)
+        score = present / len(topic_words)
+        if score > best_score:
+            best_score = score
+            best_start = _item_start(item)
+
+    if best_start is not None and best_score >= 0.6:
+        return _seconds_to_timestamp(best_start)
+
+    raise RuntimeError("Topic not found in transcript")
+
+
 def _download_audio_only(video_url: str) -> tuple[str, str]:
     temp_dir = tempfile.mkdtemp(prefix="yt_audio_")
     output_template = os.path.join(temp_dir, "audio.%(ext)s")
@@ -290,6 +365,11 @@ def _wait_for_file_active(gemini_client: genai.Client, file_name: str, timeout_s
 
 
 def _find_topic_timestamp(video_url: str, topic: str) -> str:
+    try:
+        return _find_topic_timestamp_from_transcript(video_url, topic)
+    except Exception:
+        pass
+
     gemini_api_key = os.getenv("GEMINI_API_KEY")
     if not gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
