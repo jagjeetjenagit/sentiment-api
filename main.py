@@ -10,7 +10,7 @@ import traceback
 from io import StringIO
 from contextlib import redirect_stdout, redirect_stderr
 from typing import Literal, List
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
@@ -263,9 +263,16 @@ def _download_audio_only(video_url: str) -> tuple[str, str]:
 
 def _wait_for_file_active(gemini_client: genai.Client, file_name: str, timeout_seconds: int = 300) -> object:
     deadline = time.time() + timeout_seconds
+    last_error = None
 
     while time.time() < deadline:
-        file_obj = gemini_client.files.get(name=file_name)
+        try:
+            file_obj = gemini_client.files.get(name=file_name)
+        except Exception as exc:
+            last_error = exc
+            time.sleep(2)
+            continue
+
         state_obj = getattr(file_obj, "state", None)
         state_name = getattr(state_obj, "name", str(state_obj))
 
@@ -277,6 +284,8 @@ def _wait_for_file_active(gemini_client: genai.Client, file_name: str, timeout_s
 
         time.sleep(2)
 
+    if last_error:
+        raise RuntimeError(f"Timed out waiting for Gemini file to become ACTIVE. Last error: {last_error}")
     raise RuntimeError("Timed out waiting for Gemini file to become ACTIVE")
 
 
@@ -291,7 +300,11 @@ def _find_topic_timestamp(video_url: str, topic: str) -> str:
 
         gemini_client = genai.Client(api_key=gemini_api_key)
         uploaded = gemini_client.files.upload(file=audio_path)
-        active_file = _wait_for_file_active(gemini_client, uploaded.name)
+
+        try:
+            active_file = _wait_for_file_active(gemini_client, uploaded.name)
+        except Exception:
+            active_file = uploaded
 
         prompt = f"""
 You are analyzing spoken audio from a YouTube video.
@@ -301,23 +314,34 @@ Return exactly one timestamp in HH:MM:SS format.
 Do not return explanations.
 """
 
-        response = gemini_client.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
-            contents=[active_file, prompt],
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=types.Schema(
-                    type=types.Type.OBJECT,
-                    properties={
-                        "timestamp": types.Schema(
-                            type=types.Type.STRING,
-                            pattern=r"^\\d{2}:\\d{2}:\\d{2}$",
-                        )
-                    },
-                    required=["timestamp"],
-                ),
-            ),
-        )
+        last_error = None
+        response = None
+        for _ in range(3):
+            try:
+                response = gemini_client.models.generate_content(
+                    model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+                    contents=[active_file, prompt],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=types.Schema(
+                            type=types.Type.OBJECT,
+                            properties={
+                                "timestamp": types.Schema(
+                                    type=types.Type.STRING,
+                                    pattern=r"^\\d{2}:\\d{2}:\\d{2}$",
+                                )
+                            },
+                            required=["timestamp"],
+                        ),
+                    ),
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+                time.sleep(2)
+
+        if response is None:
+            raise RuntimeError(f"Gemini request failed after retries: {last_error}")
 
         result = TimestampResult.model_validate_json(response.text)
         if not re.match(r"^\d{2}:\d{2}:\d{2}$", result.timestamp):
@@ -350,12 +374,15 @@ async def code_interpreter(request: CodeExecutionRequest):
 
 @app.post("/ask", response_model=AskResponse)
 async def ask_video(request: AskRequest):
-    timestamp = _find_topic_timestamp(request.video_url, request.topic)
-    return AskResponse(
-        timestamp=timestamp,
-        video_url=request.video_url,
-        topic=request.topic,
-    )
+    try:
+        timestamp = _find_topic_timestamp(request.video_url, request.topic)
+        return AskResponse(
+            timestamp=timestamp,
+            video_url=request.video_url,
+            topic=request.topic,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"/ask failed: {str(exc)}")
 
 def analyze_sentiment(comment):
     url = "https://sentiment-api-production-f100.up.railway.app/comment"
